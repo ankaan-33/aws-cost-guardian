@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cost Guardian governance layer - SNS alerts, least-privilege automation role and an approver policy for the cleanup runbook
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address that receives approval requests and cleanup reports
+
+Resources:
+  # Approval notifications from aws:approve only work if the topic name starts with "Automation"
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: Automation-CostGuardianAlerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Project
+          Value: CostGuardian
+
+  # Assumed by Systems Manager while the runbook runs. It can only delete
+  # volumes and release Elastic IPs that carry the project tag.
+  AutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: cost-guardian-cleanup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: FindWaste
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeAddresses
+                Resource: '*'
+              - Sid: DeleteTaggedVolumes
+                Effect: Allow
+                Action: ec2:DeleteVolume
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Project: CostGuardian
+              - Sid: ReleaseTaggedElasticIps
+                Effect: Allow
+                Action: ec2:ReleaseAddress
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Project: CostGuardian
+              - Sid: Notify
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopic
+      Tags:
+        - Key: Project
+          Value: CostGuardian
+
+  # Attach this to the person who approves cleanups. They can approve or
+  # deny a waiting run, and nothing else.
+  ApproverPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Approve or deny Cost Guardian cleanup runs
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ViewRuns
+            Effect: Allow
+            Action:
+              - ssm:DescribeAutomationExecutions
+              - ssm:DescribeAutomationStepExecutions
+              - ssm:GetAutomationExecution
+              - ssm:DescribeDocument
+              - ssm:GetDocument
+              - ssm:ListDocuments
+            Resource: '*'
+          - Sid: ApproveOrDeny
+            Effect: Allow
+            Action: ssm:SendAutomationSignal
+            Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-execution/*'
+
+Outputs:
+  TopicArn:
+    Description: Pass to the runbook as NotificationTopicArn
+    Value: !Ref AlertsTopic
+  AutomationRoleArn:
+    Description: Pass to the runbook as AutomationAssumeRole
+    Value: !GetAtt AutomationRole.Arn
+  ApproverPolicyArn:
+    Description: Attach to the IAM user who approves cleanups
+    Value: !Ref ApproverPolicy

@@ -1,0 +1,114 @@
+description: >-
+  Finds unattached EBS volumes and unassociated Elastic IPs tagged
+  Project=CostGuardian, pauses for human approval, deletes them and
+  sends a result report to SNS.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: Full ARN of CostGuardian-AutomationRole
+  Approver:
+    type: String
+    description: Full ARN of the IAM user who approves the cleanup
+  NotificationTopicArn:
+    type: String
+    description: ARN of the SNS topic (name must start with "Automation")
+  TagKey:
+    type: String
+    default: Project
+  TagValue:
+    type: String
+    default: CostGuardian
+mainSteps:
+  - name: FindWaste
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: find_waste
+      InputPayload:
+        TagKey: '{{ TagKey }}'
+        TagValue: '{{ TagValue }}'
+      Script: |
+        import boto3
+
+        def find_waste(events, context):
+            ec2 = boto3.client('ec2')
+            tag_filter = {'Name': 'tag:' + events['TagKey'], 'Values': [events['TagValue']]}
+
+            volumes = []
+            pages = ec2.get_paginator('describe_volumes').paginate(
+                Filters=[{'Name': 'status', 'Values': ['available']}, tag_filter])
+            for page in pages:
+                volumes += [v['VolumeId'] for v in page['Volumes']]
+
+            addresses = ec2.describe_addresses(
+                Filters=[{'Name': 'domain', 'Values': ['vpc']}, tag_filter])['Addresses']
+            eips = [a['AllocationId'] for a in addresses if 'AssociationId' not in a]
+
+            summary = (f"{len(volumes)} EBS volume(s): {', '.join(volumes) or 'none'} | "
+                       f"{len(eips)} Elastic IP(s): {', '.join(eips) or 'none'}")
+            return {'VolumeIds': volumes, 'EipAllocationIds': eips, 'Summary': summary}
+    outputs:
+      - Name: VolumeIds
+        Selector: $.Payload.VolumeIds
+        Type: StringList
+      - Name: EipAllocationIds
+        Selector: $.Payload.EipAllocationIds
+        Type: StringList
+      - Name: Summary
+        Selector: $.Payload.Summary
+        Type: String
+
+  - name: ApproveDeletion
+    action: aws:approve
+    timeoutSeconds: 3600
+    onFailure: Abort
+    inputs:
+      NotificationArn: '{{ NotificationTopicArn }}'
+      Message: 'CostGuardian cleanup wants to delete: {{ FindWaste.Summary }}'
+      MinRequiredApprovals: 1
+      Approvers:
+        - '{{ Approver }}'
+
+  - name: DeleteResources
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: cleanup
+      InputPayload:
+        VolumeIds: '{{ FindWaste.VolumeIds }}'
+        EipAllocationIds: '{{ FindWaste.EipAllocationIds }}'
+      Script: |
+        import boto3
+
+        def cleanup(events, context):
+            ec2 = boto3.client('ec2')
+            results = []
+            for vol in events.get('VolumeIds') or []:
+                try:
+                    ec2.delete_volume(VolumeId=vol)
+                    results.append('Deleted volume ' + vol)
+                except Exception as e:
+                    results.append(f'FAILED volume {vol}: {e}')
+            for eip in events.get('EipAllocationIds') or []:
+                try:
+                    ec2.release_address(AllocationId=eip)
+                    results.append('Released Elastic IP ' + eip)
+                except Exception as e:
+                    results.append(f'FAILED Elastic IP {eip}: {e}')
+            return {'Report': '\n'.join(results) or 'Nothing to clean up'}
+    outputs:
+      - Name: Report
+        Selector: $.Payload.Report
+        Type: String
+
+  - name: NotifyResult
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: '{{ NotificationTopicArn }}'
+      Subject: CostGuardian cleanup finished
+      Message: '{{ DeleteResources.Report }}'
